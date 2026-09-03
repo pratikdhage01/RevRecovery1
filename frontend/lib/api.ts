@@ -46,7 +46,7 @@ export async function getLiveKitToken(customerId: string) {
     }),
   });
   if (!res.ok) throw new Error("Failed to get LiveKit token");
-  return res.json() as Promise<{ token: string; room_name: string; livekit_url: string }>;
+  return res.json() as Promise<{ token: string; room_name: string; livekit_url: string; customer_id: string }>;
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────

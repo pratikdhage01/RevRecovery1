@@ -227,7 +227,7 @@ export default function DashboardPage() {
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
           <LiveDot />
-          <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+          <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }} suppressHydrationWarning>
             Last updated: {lastRefresh.toLocaleTimeString()}
           </div>
           <button className="btn-primary" onClick={load} style={{ fontSize: 13, padding: '8px 16px' }}>

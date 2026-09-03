@@ -182,7 +182,7 @@ function AuditTimeline({ events }: { events: AuditEvent[] }) {
 // ── Voice Agent Panel ─────────────────────────────────────────────────────────
 
 function VoiceAgentPanel({ customer }: { customer: Customer }) {
-  const [status, setStatus] = useState<'idle' | 'connecting' | 'connected' | 'disconnecting'>('idle');
+  const [status, setStatus] = useState<'idle' | 'connecting' | 'connected' | 'error' | 'disconnecting'>('idle');
   const [micGranted, setMicGranted] = useState(false);
   const [transcript, setTranscript] = useState<string[]>([]);
   const roomRef = useRef<Room | null>(null);
@@ -191,30 +191,47 @@ function VoiceAgentPanel({ customer }: { customer: Customer }) {
 
   const startCall = async () => {
     setStatus('connecting');
+    setTranscript([]);
     try {
-      // Request mic
+      // 1. Request microphone permission first
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach(t => t.stop()); // We just needed permission
+      stream.getTracks().forEach(t => t.stop()); // Just needed the permission grant
       setMicGranted(true);
+      setTranscript(prev => [...prev, '🎤 Microphone: Permission granted']);
 
-      // Get token from backend
-      const { token, livekit_url } = await getLiveKitToken(customer.customer_id);
+      // 2. Get LiveKit token from backend (includes URL and room name)
+      const tokenData = await getLiveKitToken(customer.customer_id);
+      const { token, livekit_url, room_name } = tokenData;
+      setTranscript(prev => [...prev, `🔑 Token: Received for room ${room_name}`]);
 
-      // Start recovery on backend
+      // 3. Start recovery session on backend (creates audit event)
       await startRecovery(customer.customer_id);
 
-      // Connect to LiveKit room
+      // 4. Create LiveKit room and wire up events BEFORE connecting
       const room = new Room({ adaptiveStream: true, dynacast: true });
       roomRef.current = room;
 
-      room.on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
+      // Remote audio track subscribed → attach and play it
+      room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
         if (track.kind === Track.Kind.Audio) {
-          const audioEl = track.attach();
+          const audioEl = track.attach() as HTMLAudioElement;
+          // Required for Chrome/Firefox autoplay policy when joining via button click
+          audioEl.autoplay = true;
+          audioEl.muted = false;
+          audioEl.volume = 1.0;
           document.body.appendChild(audioEl);
+          setTranscript(prev => [...prev, `🔊 Audio: Agent audio track received from ${participant.identity}`]);
           setAgentTalking(true);
         }
       });
 
+      room.on(RoomEvent.TrackUnsubscribed, (track) => {
+        if (track.kind === Track.Kind.Audio) {
+          track.detach().forEach(el => el.remove());
+        }
+      });
+
+      // Update speaking indicators
       room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
         const local = speakers.find(s => s.isLocal);
         const remote = speakers.find(s => !s.isLocal);
@@ -222,30 +239,57 @@ function VoiceAgentPanel({ customer }: { customer: Customer }) {
         setAgentTalking(!!remote);
       });
 
+      // Remote participant joined → likely the AI agent
+      room.on(RoomEvent.ParticipantConnected, (participant) => {
+        setTranscript(prev => [...prev, `🤖 Agent: ${participant.identity} joined the room`]);
+      });
+
+      // Room fully connected
+      room.on(RoomEvent.Connected, () => {
+        setTranscript(prev => [...prev, '✅ LiveKit: Connected — waiting for AI agent...']);
+      });
+
+      // Connection state changes (useful for debugging)
+      room.on(RoomEvent.ConnectionStateChanged, (state) => {
+        console.log('[LiveKit] Connection state:', state);
+      });
+
       room.on(RoomEvent.Disconnected, () => {
         setStatus('idle');
         setAgentTalking(false);
         setUserTalking(false);
+        setTranscript(prev => [...prev, '📴 Call ended']);
+        // Clean up any lingering audio elements
+        document.querySelectorAll('audio[data-lk-audio]').forEach(el => el.remove());
       });
 
-      await room.connect(livekit_url, token, {
-        autoSubscribe: true,
-      });
+      // 5. Connect to LiveKit room using URL from backend (never hardcoded)
+      setTranscript(prev => [...prev, `📡 Connecting to LiveKit room: ${room_name}...`]);
+      await room.connect(livekit_url, token, { autoSubscribe: true });
+
+      // 6. Publish microphone track so the agent can hear us
       await room.localParticipant.setMicrophoneEnabled(true);
+      setTranscript(prev => [...prev, '🎤 Microphone: Publishing audio to room']);
 
+      // Only mark connected AFTER room.connect() resolves (RoomEvent.Connected also fires)
       setStatus('connected');
-      setTranscript(prev => [...prev, `🤖 Agent: Connected to recovery session for ${customer.name}...`]);
 
     } catch (err: any) {
-      console.error('Failed to start call:', err);
-      setStatus('idle');
-      setTranscript(prev => [...prev, `❌ Error: ${err.message}`]);
+      console.error('[LiveKit] Failed to start call:', err);
+      setStatus('error');
+      setTranscript(prev => [...prev, `❌ Error: ${err.message || 'Unknown error'}`]);
     }
   };
 
   const endCall = async () => {
     setStatus('disconnecting');
     if (roomRef.current) {
+      // Detach all remote audio tracks before disconnecting
+      roomRef.current.remoteParticipants.forEach(participant => {
+        participant.audioTrackPublications.forEach(pub => {
+          if (pub.track) pub.track.detach().forEach(el => el.remove());
+        });
+      });
       await roomRef.current.disconnect();
       roomRef.current = null;
     }
@@ -256,6 +300,7 @@ function VoiceAgentPanel({ customer }: { customer: Customer }) {
 
   const isConnected = status === 'connected';
   const isConnecting = status === 'connecting';
+  const isError = status === 'error';
 
   return (
     <div className={`card ${isConnected ? 'animate-glow-pulse' : ''}`} style={{
@@ -349,11 +394,22 @@ function VoiceAgentPanel({ customer }: { customer: Customer }) {
             ✕ End Call
           </button>
         )}
+        {status === 'error' && (
+          <button id="retry-recovery-call" className="btn-primary" onClick={startCall}
+            style={{ width: '100%', justifyContent: 'center', padding: '12px 20px', fontSize: 14 }}>
+            ↺ Retry Connection
+          </button>
+        )}
 
-        {/* Microphone tip */}
+        {/* Microphone tip / Error */}
         {!micGranted && status === 'idle' && (
           <p style={{ fontSize: 12, color: 'var(--color-text-muted)', textAlign: 'center', marginTop: 10 }}>
             Browser will request microphone permission when you start.
+          </p>
+        )}
+        {isError && (
+          <p style={{ fontSize: 12, color: '#ef4444', textAlign: 'center', marginTop: 10 }}>
+            Connection failed. Check browser console and ensure LiveKit worker is running.
           </p>
         )}
 

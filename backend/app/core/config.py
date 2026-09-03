@@ -1,52 +1,74 @@
 """
-Application configuration using pydantic-settings.
-Reads from .env file automatically.
+Application configuration loaded from environment variables.
 """
-from pydantic_settings import BaseSettings
-from pydantic import Field
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    # -------------------------------------------------------------------------
     # MongoDB
-    MONGODB_URI: str = Field(default="mongodb://localhost:27017")
-    MONGODB_DB_NAME: str = Field(default="revenue_recovery")
+    # -------------------------------------------------------------------------
+    MONGODB_URI: str
+    MONGODB_DB_NAME: str = "revenue_recovery"
 
+    # -------------------------------------------------------------------------
     # Razorpay
-    RAZORPAY_KEY_ID: str = Field(default="")
-    RAZORPAY_KEY_SECRET: str = Field(default="")
-    RAZORPAY_WEBHOOK_SECRET: str = Field(default="")
+    # -------------------------------------------------------------------------
+    RAZORPAY_KEY_ID: str
+    RAZORPAY_KEY_SECRET: str
+    RAZORPAY_WEBHOOK_SECRET: str = ""
 
+    # -------------------------------------------------------------------------
     # LiveKit
-    LIVEKIT_URL: str = Field(default="")
-    LIVEKIT_API_KEY: str = Field(default="")
-    LIVEKIT_API_SECRET: str = Field(default="")
+    # -------------------------------------------------------------------------
+    LIVEKIT_URL: str
+    LIVEKIT_API_KEY: str
+    LIVEKIT_API_SECRET: str
 
+    # -------------------------------------------------------------------------
     # Google Gemini
-    GOOGLE_API_KEY: str = Field(default="")
+    # -------------------------------------------------------------------------
+    GOOGLE_API_KEY: str
 
-    # Deepgram STT
-    DEEPGRAM_API_KEY: str = Field(default="")
+    # -------------------------------------------------------------------------
+    # Deepgram
+    # -------------------------------------------------------------------------
+    DEEPGRAM_API_KEY: str
 
-    # ElevenLabs TTS
-    ELEVENLABS_API_KEY: str = Field(default="")
-    ELEVENLABS_VOICE_ID: str = Field(default="EXAVITQu4vr4xnSDxMaL")
+    # -------------------------------------------------------------------------
+    # ElevenLabs
+    # -------------------------------------------------------------------------
+    ELEVENLABS_API_KEY: str
+    ELEVENLABS_VOICE_ID: str
 
-    # Recovery Policy Thresholds
-    MAX_CALL_ATTEMPTS: int = Field(default=2)
-    MAX_PAYMENT_LINKS: int = Field(default=2)
-    MAX_REMINDERS: int = Field(default=2)
-    MAX_RECOVERY_DAYS: int = Field(default=7)
-    AUTO_RECOVERY_LIMIT: float = Field(default=5000.0)   # INR
-    HIGH_VALUE_THRESHOLD: float = Field(default=25000.0)  # INR
+    # -------------------------------------------------------------------------
+    # Recovery Policy
+    # -------------------------------------------------------------------------
+    MAX_CALL_ATTEMPTS: int = 2
+    MAX_PAYMENT_LINKS: int = 2
+    MAX_REMINDERS: int = 2
+    MAX_RECOVERY_DAYS: int = 7
 
-    # App
-    FRONTEND_URL: str = Field(default="http://localhost:3000")
-    ENVIRONMENT: str = Field(default="development")
+    AUTO_RECOVERY_LIMIT: float = 5000
+    HIGH_VALUE_THRESHOLD: float = 25000
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        extra = "ignore"
+    # -------------------------------------------------------------------------
+    # Application
+    # -------------------------------------------------------------------------
+    BACKEND_PORT: int = 8000
+    FRONTEND_URL: str = "http://localhost:3000"
+    ENVIRONMENT: str = "development"
+
+    # -------------------------------------------------------------------------
+    # Pydantic Settings
+    # -------------------------------------------------------------------------
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore",
+    )
 
 
 settings = Settings()

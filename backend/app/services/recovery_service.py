@@ -144,6 +144,8 @@ async def evaluate_recovery_policy(
     if start_date:
         if isinstance(start_date, str):
             start_date = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+        elif isinstance(start_date, datetime) and start_date.tzinfo is None:
+            start_date = start_date.replace(tzinfo=timezone.utc)
         recovery_days = (datetime.now(timezone.utc) - start_date).days
     else:
         recovery_days = 0

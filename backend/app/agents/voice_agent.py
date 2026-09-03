@@ -30,8 +30,10 @@ import json
 from datetime import datetime
 from typing import Optional
 
-# Allow running from backend directory
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Ensure backend directory is in sys.path so 'app' package is importable
+BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -44,9 +46,9 @@ from livekit.agents import (
     JobProcess,
     RoomInputOptions,
     WorkerOptions,
-    cli,
     function_tool,
 )
+from livekit.agents.cli import run_app
 from livekit.plugins import deepgram, elevenlabs, silero
 from livekit.plugins import google as livekit_google
 
@@ -80,41 +82,25 @@ Your persona:
 - You ask ONE question at a time.
 - You listen carefully before responding.
 - You never invent payment or invoice information.
-- All information comes strictly from the customer database.
 
-Your goal:
-- Understand why the customer's payment failed or is overdue.
-- Verify the customer's identity and payment context.
-- Understand their intent (willing to pay, can't pay right now, disputes the invoice, etc.).
-- Based on the conversation, extract structured signals for the Policy Engine.
-- The Policy Engine (not you) makes the final decision about whether to create a payment link.
+CONVERSATION FLOW:
+1. Turn 1 (Greeting):
+   You greet the customer by name, mention the pending invoice and amount, and ask if they can discuss it.
+2. Turn 2 (Listen & Propose Alternative):
+   When customer mentions card failed or payment issue, empathetically acknowledge in Hinglish and ask:
+   "Samajh gaya. Aapki card payment fail ho gayi hai. Kya aap alternative payment method se payment complete karna chahenge? Jaise UPI ya netbanking?"
+3. Turn 3 (Execute & Confirm Link):
+   When customer agrees to pay via UPI or alternative method (e.g. "may upi se kar skta hu", "haan upi se kar do", "theek hai"):
+   - Call confirm_payment_intent_and_create_link()
+   - Speak back to customer immediately:
+     "Bahut badiya! Maine aapka verification complete kar diya hai aur aapke registered mobile number aur email par secure Razorpay UPI payment link bhej diya hai. Aap wahan se payment complete kar sakte hain."
+4. Turn 4 (Closing):
+   When customer confirms or thanks you (e.g. "link mil gaya", "payment kar raha hoon", "thank you"):
+   - Say: "Shukriya! Jaise hi payment complete hogi, aapka account update ho jayega. Have a great day!"
 
 CRITICAL RULES:
-1. NEVER create, mention, or promise a payment link unless the Policy Engine approves it.
-2. NEVER accept the customer's stated amount if it differs from the database amount.
-3. NEVER change the registered phone/email contact.
-4. NEVER claim payment succeeded unless the webhook confirms it.
-5. If a customer disputes the invoice, say you are escalating to the team.
-6. If a customer refuses to pay, note it respectfully and end the conversation.
-7. If you cannot verify the customer, escalate.
-
-Example Hinglish phrases to use naturally:
-- "Namaste [Name], main AI Revenue Recovery team se bol raha hoon."
-- "Aapke account par [amount] ka payment pending hai."
-- "Kya aap iske baare mein baat karna chahenge?"
-- "Samajh gaya. Main check karta hoon."
-- "Bilkul, main aapke registered contact par secure payment link bhej raha hoon."
-- "Aapki baat samajh aai. Main ise escalate kar raha hoon hamare team ke paas."
-
-Recovery workflow stages:
-1. Greet customer by name (from database).
-2. State the payment issue and amount (from database only).
-3. Ask if they want to discuss the payment.
-4. Listen to their situation.
-5. Ask verification questions based on their context.
-6. Determine their intent.
-7. Report intent to Policy Engine via tool calls.
-8. Follow the policy decision.
+1. ALWAYS speak aloud back to the customer on every turn. Never finish your turn silently.
+2. Keep replies natural, polite, and concise (1-3 sentences).
 """
 
 # ---------------------------------------------------------------------------
@@ -145,12 +131,52 @@ class RecoveryAgent(Agent):
     # -----------------------------------------------------------------------
 
     @function_tool
+    async def confirm_payment_intent_and_create_link(self) -> str:
+        """
+        Call this when the customer verifies their identity and agrees to pay
+        (e.g., via UPI, netbanking, or alternative payment method).
+        This reports verified intent to the Policy Engine and creates the Razorpay payment link.
+        """
+        logger.info(f"🎯 [Tool: confirm_payment_intent_and_create_link] Processing for {self.customer_id}")
+        self._signals = ConversationSignals(
+            customer_verified=True,
+            willing_to_pay=True,
+        )
+        policy_result = await evaluate_recovery_policy(self.customer_id, self._signals)
+        if not policy_result:
+            return json.dumps({"error": "Policy evaluation failed"})
+
+        logger.info(f"🎯 Policy decision for {self.customer_id}: {policy_result['decision']}")
+        if not policy_result.get("can_create_payment_link"):
+            return json.dumps({
+                "policy_decision": str(policy_result["decision"]),
+                "reason": policy_result["reason"],
+                "can_create_payment_link": False,
+            })
+
+        link_result = await create_recovery_payment_link(self.customer_id)
+        if not link_result or "error" in link_result:
+            error_msg = link_result.get("error", "Failed to create payment link") if link_result else "Failed"
+            return json.dumps({"error": error_msg})
+
+        customer = await self._get_customer_data()
+        amount = customer["amount_due"] if customer else 2499
+        logger.info(f"✅ [Tool: confirm_payment_intent_and_create_link] Payment link created: {link_result.get('short_url')}")
+        return json.dumps({
+            "success": True,
+            "policy_decision": "RECOVER_NOW",
+            "amount": amount,
+            "short_url": link_result.get("short_url"),
+            "message": f"Payment link created for INR {amount}. Sent to customer registered mobile and email.",
+        })
+
+    @function_tool
     async def get_customer_info(self) -> str:
         """
-        Get the customer's basic information from the database. Call this first.
-        Returns customer_id, name, invoice_id, amount_due, payment_status,
-        failure_reason, days_overdue, previous_attempts, and risk_level.
+        Get the customer's basic information from the database if needed.
+        Note: Customer details are already in the system prompt.
         """
+        logger.info(f"🔍 [Tool: get_customer_info] Fetching info for {self.customer_id}")
         customer = await self._get_customer_data()
         if not customer:
             return json.dumps({"error": "Customer not found in database. Cannot proceed."})
@@ -173,6 +199,7 @@ class RecoveryAgent(Agent):
         Returns status, call_attempts, payment_links_generated, current_decision,
         promise_to_pay, escalated flag, and amount_recovered.
         """
+        logger.info(f"🔍 [Tool: get_recovery_state] Fetching recovery state for {self.customer_id}")
         customer = await self._get_customer_data()
         if not customer:
             return json.dumps({"error": "Customer not found"})
@@ -208,6 +235,7 @@ class RecoveryAgent(Agent):
         IMPORTANT: All boolean fields default to False. Only set to True if
         you are CERTAIN from the conversation.
         """
+        logger.info(f"📊 [Tool: report_conversation_signals] verified={customer_verified}, willing={willing_to_pay}, dispute={dispute_raised}")
         self._signals = ConversationSignals(
             customer_verified=customer_verified,
             willing_to_pay=willing_to_pay,
@@ -245,10 +273,12 @@ class RecoveryAgent(Agent):
         from the customer's verbal statement. Do NOT call this if policy
         decision is anything other than RECOVER_NOW.
         """
+        logger.info(f"💳 [Tool: create_payment_link] Generating link for {self.customer_id}")
         result = await create_recovery_payment_link(self.customer_id)
         if result is None:
             return json.dumps({"error": "Customer not found"})
         if "error" in result:
+            logger.warning(f"⚠️ [Tool: create_payment_link] Failed: {result['error']}")
             return json.dumps({
                 "error": result["error"],
                 "policy_decision": result.get("decision"),
@@ -257,6 +287,7 @@ class RecoveryAgent(Agent):
 
         customer = await self._get_customer_data()
         customer_name = customer["name"] if customer else "the customer"
+        logger.info(f"✅ [Tool: create_payment_link] Created: {result.get('short_url')}")
         return json.dumps({
             "success": True,
             "link_id": result["link_id"],
@@ -312,23 +343,31 @@ class RecoveryAgent(Agent):
 
 async def entrypoint(ctx: JobContext):
     """Main LiveKit agent entrypoint."""
-    # Connect to MongoDB
+    logger.info("🚀 Entrypoint called — connecting to MongoDB")
     await connect_db()
 
-    # Extract customer_id from room metadata or name
-    room_name = ctx.room.name  # e.g. "recovery-CUS_001"
+    # Extract customer_id from room name, e.g. "recovery-CUS_001"
+    room_name = ctx.room.name
     customer_id = room_name.replace("recovery-", "") if room_name.startswith("recovery-") else "CUS_001"
 
     logger.info(f"🎙️  Voice agent starting for room: {room_name}, customer: {customer_id}")
 
+    # NOTE: Do NOT call ctx.connect() here.
+    # session.start(agent, room=ctx.room) first starts RoomIO (which sets up
+    # audio input/output listeners), then calls job_ctx.connect() internally.
+    # If we connect early, RoomIO is not yet set up when existing participants
+    # are processed, and the browser's microphone track is silently missed —
+    # the agent would speak but never hear the user.
+
     # Fetch initial customer context
-    # Note: ctx.connect() is called automatically by session.start() internally
     customer = await get_customer(customer_id)
     if not customer:
         logger.error(f"❌ Customer {customer_id} not found in database")
         customer = {"name": "Unknown", "amount_due": 0, "payment_status": "UNKNOWN", "invoice_id": "UNKNOWN"}
+    else:
+        logger.info(f"✅ Customer loaded: {customer['name']}, amount: {customer['amount_due']}")
 
-    # Build context-aware initial message
+    # Build context-aware initial message (Hinglish)
     initial_message = (
         f"Namaste {customer['name']}, main AI Revenue Recovery team se bol raha hoon. "
         f"Aapke account par ₹{customer['amount_due']:,.0f} ka payment pending hai "
@@ -353,14 +392,15 @@ async def entrypoint(ctx: JobContext):
     )
     full_instructions = SYSTEM_PROMPT + f"\n\nCurrent customer context:\n{customer_ctx}"
 
-    # Build the agent (instructions set dynamically with customer context)
+    # Build the agent with full customer-specific instructions
     agent = RecoveryAgent(
         customer_id=customer_id,
         initial_message=initial_message,
     )
-    agent._instructions = full_instructions  # override with customer-specific context
+    # Override instructions with customer-specific context
+    agent._instructions = full_instructions
 
-    # Create and start the session
+    logger.info("🤖 Creating AgentSession (VAD + STT + LLM + TTS)")
     session = AgentSession(
         vad=silero.VAD.load(),
         stt=deepgram.STT(
@@ -368,7 +408,7 @@ async def entrypoint(ctx: JobContext):
             language="en-IN",   # Indian English — best for Hinglish
         ),
         llm=livekit_google.LLM(
-            model="gemini-2.0-flash-exp",
+            model="gemini-3.5-flash-lite",
             api_key=settings.GOOGLE_API_KEY,
         ),
         tts=elevenlabs.TTS(
@@ -376,16 +416,20 @@ async def entrypoint(ctx: JobContext):
             voice_id=settings.ELEVENLABS_VOICE_ID,
             model="eleven_multilingual_v2",  # Supports Hindi
         ),
+        max_tool_steps=8,
     )
 
-    # In v1.7, session.start() takes agent as the first positional arg.
-    # The JobContext (room connection) is discovered automatically via get_job_context().
-    await session.start(agent)
+    # CRITICAL: pass room=ctx.room so AgentSession creates RoomIO and wires up
+    # audio I/O. Without this, no RoomIO is created and the agent never speaks.
+    # The on_enter() method on RecoveryAgent handles the initial greeting.
+    logger.info("▶️  Starting AgentSession with room IO")
+    await session.start(agent, room=ctx.room)
+    logger.info("✅ AgentSession started — agent should now speak")
 
     # Log call ended on disconnect
     @ctx.room.on("participant_disconnected")
     def on_disconnect(participant):
-        logger.info(f"Participant disconnected: {participant.identity}")
+        logger.info(f"📴 Participant disconnected: {participant.identity}")
         asyncio.create_task(
             log_audit_event(AuditEvent(
                 customer_id=customer_id,
@@ -402,7 +446,7 @@ def prewarm(proc: JobProcess):
 
 
 if __name__ == "__main__":
-    cli.run_app(
+    run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,

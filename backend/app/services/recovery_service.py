@@ -14,7 +14,7 @@ from app.models.customer import (
 )
 from app.models.policy import PolicyContext, PolicyResult, ConversationSignals
 from app.policies.recovery_policy import evaluate_policy
-from app.services import razorpay_service
+from app.services import razorpay_service, email_service
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -236,9 +236,11 @@ async def create_recovery_payment_link(customer_id: str) -> Optional[dict]:
         description=f"Payment recovery for invoice {customer['invoice_id']}",
     )
 
+    short_url: str = str(link.get("short_url") or link.get("id") or "")
+
     link_record = {
         "link_id": link["id"],
-        "short_url": link.get("short_url", link.get("id", "")),
+        "short_url": short_url,
         "amount": customer["amount_due"],
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "created",
@@ -268,12 +270,26 @@ async def create_recovery_payment_link(customer_id: str) -> Optional[dict]:
         amount=customer["amount_due"],
         actor="AI_AGENT",
         reason="Policy engine authorized payment link creation",
-        metadata={"link_id": link["id"], "short_url": link.get("short_url", "")},
+        metadata={"link_id": link["id"], "short_url": short_url},
     ))
+
+    # Dispatch payment link email if customer email and short_url are present
+    customer_email = customer.get("contact", {}).get("email")
+    if customer_email and short_url:
+        try:
+            await email_service.send_payment_link_email(
+                to_email=customer_email,
+                customer_name=customer.get("name", "Valued Customer"),
+                invoice_id=customer.get("invoice_id", ""),
+                amount=customer["amount_due"],
+                payment_link=short_url,
+            )
+        except Exception as exc:
+            logger.warning(f"Could not send payment link email to {customer_email}: {exc}")
 
     return {
         "link_id": link["id"],
-        "short_url": link.get("short_url", ""),
+        "short_url": short_url,
         "amount": customer["amount_due"],
         "customer_name": customer["name"],
     }

@@ -48,7 +48,9 @@ from livekit.agents import (
     WorkerOptions,
     function_tool,
 )
+from livekit.agents._exceptions import APIStatusError
 from livekit.agents.cli import run_app
+from livekit.agents import llm as agents_llm
 from livekit.plugins import deepgram, elevenlabs, silero
 from livekit.plugins import google as livekit_google
 
@@ -68,11 +70,87 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+class FallbackLLM(agents_llm.LLM):
+    """
+    Wraps a primary Google LLM and transparently falls back to a secondary
+    model when the primary returns a 503 (high-demand / unavailable) error.
+
+    Usage:
+        llm = FallbackLLM(
+            primary=livekit_google.LLM(model="gemini-3.1-flash-lite", ...),
+            fallback=livekit_google.LLM(model="gemini-2.0-flash", ...),
+        )
+    """
+
+    def __init__(
+        self,
+        primary: agents_llm.LLM,
+        fallback: agents_llm.LLM,
+    ):
+        super().__init__()
+        self._primary = primary
+        self._fallback = fallback
+
+    def chat(
+        self,
+        *,
+        chat_ctx: agents_llm.ChatContext,
+        tools: list | None = None,
+        **kwargs,
+    ) -> agents_llm.LLMStream:
+        """Try primary; on 503 fall back to secondary model."""
+        try:
+            stream = self._primary.chat(chat_ctx=chat_ctx, tools=tools, **kwargs)
+            return _FallbackStream(stream, self._fallback, chat_ctx, tools, kwargs)
+        except APIStatusError as e:
+            if e.status_code == 503:
+                logger.warning(
+                    f"Primary LLM unavailable (503), switching to fallback model. error={e}"
+                )
+                return self._fallback.chat(chat_ctx=chat_ctx, tools=tools, **kwargs)
+            raise
+
+
+class _FallbackStream(agents_llm.LLMStream):
+    """
+    Wraps a primary LLMStream and switches to the fallback LLM
+    mid-stream if a 503 is encountered during async iteration.
+    """
+
+    def __init__(self, primary_stream, fallback_llm, chat_ctx, tools, kwargs):
+        super().__init__(primary_stream._llm, chat_ctx=chat_ctx, tools=tools or [], conn_options=primary_stream._conn_options)
+        self._primary_stream = primary_stream
+        self._fallback_llm = fallback_llm
+        self._chat_ctx = chat_ctx
+        self._tools = tools
+        self._kwargs = kwargs
+
+    async def _run(self) -> None:
+        try:
+            async for chunk in self._primary_stream:
+                self._event_ch.send_nowait(chunk)
+        except APIStatusError as e:
+            if e.status_code == 503:
+                logger.warning(
+                    f"Primary LLM stream failed mid-response (503), "
+                    f"retrying with fallback model. error={e}"
+                )
+                fallback_stream = self._fallback_llm.chat(
+                    chat_ctx=self._chat_ctx,
+                    tools=self._tools,
+                    **self._kwargs,
+                )
+                async for chunk in fallback_stream:
+                    self._event_ch.send_nowait(chunk)
+            else:
+                raise
+
 # ---------------------------------------------------------------------------
 # System prompt — sets the Hinglish agent persona
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """
+BASE_SYSTEM_PROMPT = """
 You are an AI Revenue Recovery Agent for a fintech company that uses Razorpay for payments.
 
 Your persona:
@@ -80,27 +158,84 @@ Your persona:
 - You speak naturally in Hinglish (mix of Hindi and English).
 - You never pressure the customer aggressively.
 - You ask ONE question at a time.
-- You listen carefully before responding.
 - You never invent payment or invoice information.
 
-CONVERSATION FLOW:
-1. Turn 1 (Greeting):
-   You greet the customer by name, mention the pending invoice and amount, and ask if they can discuss it.
-2. Turn 2 (Listen & Propose Alternative):
-   When customer mentions card failed or payment issue, empathetically acknowledge in Hinglish and ask:
-   "Samajh gaya. Aapki card payment fail ho gayi hai. Kya aap alternative payment method se payment complete karna chahenge? Jaise UPI ya netbanking?"
-3. Turn 3 (Execute & Confirm Link):
-   When customer agrees to pay via UPI or alternative method (e.g. "may upi se kar skta hu", "haan upi se kar do", "theek hai"):
-   - Call confirm_payment_intent_and_create_link()
-   - Speak back to customer immediately:
-     "Bahut badiya! Maine aapka verification complete kar diya hai aur aapke registered mobile number aur email par secure Razorpay UPI payment link bhej diya hai. Aap wahan se payment complete kar sakte hain."
-4. Turn 4 (Closing):
-   When customer confirms or thanks you (e.g. "link mil gaya", "payment kar raha hoon", "thank you"):
-   - Say: "Shukriya! Jaise hi payment complete hogi, aapka account update ho jayega. Have a great day!"
+SPEECH FORMATTING — MANDATORY RULES FOR EVERY RESPONSE:
+These rules apply to every single word you say. No exceptions.
+- AMOUNTS: Write amounts in spoken English words only.
+  ₹2499 or 2499 or 2,499 → say "two thousand four hundred ninety nine rupees"
+  ₹4999 → say "four thousand nine hundred ninety nine rupees"
+  NEVER write ₹ symbol or commas in your spoken text.
+- INVOICE IDs: Spell every character with spaces. INV_001 → say "INV 001".
+- UPI: ALWAYS say "UPI" as three separate capital letters. Write it as "U P I" in your text.
+- PAYMENT METHODS: Keep English — "netbanking", "credit card", "debit card".
+
+CONVERSATION FLOW — GENERAL RULES:
+1. GREETING — You will be given the opening line to say. Say it exactly as given.
+2. Listen carefully. Identify the customer's situation from what they say.
+3. Ask ONE question at a time. Never pepper the customer with multiple questions.
+4. Keep all replies short — 1 to 2 sentences max.
+5. NEVER stay silent on any turn. Always say something.
+6. NEVER write the ₹ symbol — always write amounts in full spoken English words.
+
+SCENARIO HANDLING:
+
+A) PAYMENT FAILED (card declined, method failed, etc.):
+   - Customer confirms card/payment failed → offer UPI or netbanking.
+   - Say: "Samajh gaya. Kya aap U P I ya netbanking se try karna chahenge?"
+   - On agreement → IMMEDIATELY call confirm_payment_intent_and_create_link().
+
+B) OVERDUE / NOT YET PAID:
+   - Ask politely why payment hasn't been made yet.
+   - If willing to pay now → call confirm_payment_intent_and_create_link() immediately.
+   - If they say they'll pay later (promise-to-pay) → call record_promise_to_pay().
+   - If they dispute the amount → call escalate_to_human().
+
+C) CUSTOMER AGREES TO PAY (any scenario):
+   Trigger words: "haan", "theek hai", "abhi karta hoon", "upi se", "kar do",
+   "send karo", "bhejo", "link bhejo", or any clear agreement to pay now.
+   IMMEDIATELY AND WITHOUT ASKING ANYTHING ELSE:
+   Step A — Say out loud: "Bilkul, ek second. Main aapke liye payment link generate kar raha hoon."
+   Step B — Call the tool: confirm_payment_intent_and_create_link()
+   Step C — After tool returns success, say:
+   "Ho gaya! Maine aapke registered mobile aur email par secure Razorpay payment link bhej diya hai."
+
+D) PROMISE TO PAY LATER:
+   Customer says they'll pay on a specific future date.
+   - Confirm the date with them.
+   - Call record_promise_to_pay() with the date in YYYY-MM-DD format.
+   - Say: "Theek hai, main aapka promise record kar raha hoon. Koi pressure nahi."
+   - Do NOT create a payment link.
+
+E) DISPUTE / WRONG INVOICE:
+   Customer disputes the amount or invoice.
+   - Call escalate_to_human() with the reason.
+   - Say: "Samajh gaya. Main is case ko hamari team ke paas forward kar raha hoon."
+
+F) HIGH VALUE (above ₹25,000) or REFUSED TO PAY:
+   - Call escalate_to_human().
+   - Say: "Aapka case hamari senior team ko transfer kar raha hoon."
+
+G) CUSTOMER SAYS ALREADY PAID:
+   - Thank them and say the team will verify the payment.
+   - Call report_conversation_signals(customer_verified=True).
 
 CRITICAL RULES:
-1. ALWAYS speak aloud back to the customer on every turn. Never finish your turn silently.
-2. Keep replies natural, polite, and concise (1-3 sentences).
+1. When customer agrees to pay → call confirm_payment_intent_and_create_link() IMMEDIATELY. No extra questions.
+2. Never create a payment link without customer's explicit agreement.
+3. If unsure of customer's intent → use report_conversation_signals() to check policy.
+
+ANTI-HALLUCINATION RULES — THESE ARE NON-NEGOTIABLE:
+1. NEVER invent, assume, or add ANY information the customer did not explicitly say.
+   - If customer says "kal karunga" → only respond about paying tomorrow. Do NOT add reasons like "medical emergency" or "salary issue" unless the customer said those exact words.
+   - If customer says "salary aayegi" → acknowledge salary timing ONLY. Do not add other context.
+2. If you are NOT SURE what the customer said, always ask them to repeat:
+   Say: "Maaf kijiye, mujhe clearly nahi suna. Kya aap dobara bol sakte hain?"
+   NEVER guess or fill in missing words with assumptions.
+3. ONLY use reasons and information the customer has explicitly stated in this conversation.
+   Do not draw on common reasons, cultural assumptions, or anything not directly said.
+4. When recording a promise-to-pay, only use the exact date/timing the customer mentioned.
+   If no date was given, ask: "Kab tak payment ho sakti hai?"
 """
 
 # ---------------------------------------------------------------------------
@@ -111,7 +246,7 @@ class RecoveryAgent(Agent):
     """Voice agent that handles the full recovery conversation workflow."""
 
     def __init__(self, customer_id: str, initial_message: str):
-        super().__init__(instructions=SYSTEM_PROMPT)
+        super().__init__(instructions=BASE_SYSTEM_PROMPT)
         self.customer_id = customer_id
         self.initial_message = initial_message
         self._customer_data = None
@@ -133,9 +268,12 @@ class RecoveryAgent(Agent):
     @function_tool
     async def confirm_payment_intent_and_create_link(self) -> str:
         """
-        Call this when the customer verifies their identity and agrees to pay
-        (e.g., via UPI, netbanking, or alternative payment method).
-        This reports verified intent to the Policy Engine and creates the Razorpay payment link.
+        Call this tool THE MOMENT the customer agrees to pay via UPI, netbanking,
+        or any alternative method. Trigger words include: "haan", "theek hai",
+        "upi se kar do", "link bhejo", "send karo", or any agreement to pay.
+        DO NOT ask any follow-up question before calling this — call it immediately.
+        Before calling this tool, say out loud:
+        "Bilkul, ek second. Main aapke liye payment link generate kar raha hoon."
         """
         logger.info(f"🎯 [Tool: confirm_payment_intent_and_create_link] Processing for {self.customer_id}")
         self._signals = ConversationSignals(
@@ -367,12 +505,25 @@ async def entrypoint(ctx: JobContext):
     else:
         logger.info(f"✅ Customer loaded: {customer['name']}, amount: {customer['amount_due']}")
 
-    # Build context-aware initial message (Hinglish)
+    # Build context-aware initial message with spoken-English amounts for TTS
+    amount = customer.get("amount_due", 0)
+    invoice_id = str(customer.get("invoice_id", "UNKNOWN"))
+
+    # Convert amount to spoken English so TTS reads it correctly (avoids ₹ symbol)
+    try:
+        amount_int = int(amount)
+        spoken_amount = f"{amount_int} rupees"
+    except Exception:
+        spoken_amount = f"{amount} rupees"
+
+    # Spell out invoice ID characters for TTS (INV_001 -> INV 001)
+    spoken_invoice = invoice_id.replace("_", " ")
+
+    # Short greeting — TTS ends fast so agent enters listening mode quickly.
+    # Invoice details are already in the LLM system prompt; no need to repeat in greeting.
     initial_message = (
-        f"Namaste {customer['name']}, main AI Revenue Recovery team se bol raha hoon. "
-        f"Aapke account par ₹{customer['amount_due']:,.0f} ka payment pending hai "
-        f"invoice {customer['invoice_id']} ke liye. "
-        f"Kya aap iske baare mein baat karna chahenge?"
+        f"Namaste {customer['name']}! Aapke account mein {spoken_amount} ka payment pending hai. "
+        f"Kya main help kar sakta hoon?"
     )
 
     # Log call started
@@ -384,13 +535,51 @@ async def entrypoint(ctx: JobContext):
         reason=f"Voice recovery call started in room {room_name}",
     ))
 
-    # Inject customer context into the system prompt
+    # Build a scenario-aware system prompt based on the customer's actual situation
+    payment_status = customer.get("payment_status", "UNKNOWN")
+    failure_reason = customer.get("failure_reason", "NONE")
+    days_overdue = customer.get("days_overdue", 0)
+    risk_level = customer.get("risk_level", "MEDIUM")
+    amount_due = customer.get("amount_due", 0)
+
+    if payment_status == "PAYMENT_FAILED" and failure_reason not in ("NONE", None, ""):
+        scenario_hint = (
+            f"SCENARIO: Customer's payment FAILED (reason: {failure_reason}). "
+            "Lead with empathy about the failure and offer UPI/netbanking as an alternative."
+        )
+    elif payment_status in ("OVERDUE", "PENDING"):
+        scenario_hint = (
+            f"SCENARIO: Payment is OVERDUE by {days_overdue} day(s). "
+            "Ask why payment hasn't been made. Be empathetic — they may have a genuine reason. "
+            "If willing to pay now → create link. If promising later → record promise. If dispute → escalate."
+        )
+    elif payment_status == "PAID":
+        scenario_hint = (
+            "SCENARIO: This customer has ALREADY PAID. "
+            "Thank them politely and clarify there may have been a system delay. End the call gracefully."
+        )
+    else:
+        scenario_hint = (
+            f"SCENARIO: Payment status is {payment_status}. "
+            "Ask the customer about their payment situation and respond accordingly."
+        )
+
+    if float(amount_due) > settings.HIGH_VALUE_THRESHOLD:
+        scenario_hint += (
+            f" IMPORTANT: Amount (₹{amount_due:,.0f}) exceeds high-value threshold. "
+            "Do NOT create a payment link automatically — escalate to human team."
+        )
+
     customer_ctx = json.dumps(
         {k: v for k, v in customer.items() if k not in ("recovery_state", "_id")},
         indent=2,
         default=str,
     )
-    full_instructions = SYSTEM_PROMPT + f"\n\nCurrent customer context:\n{customer_ctx}"
+    full_instructions = (
+        BASE_SYSTEM_PROMPT
+        + f"\n\n--- CUSTOMER CONTEXT ---\n{customer_ctx}"
+        + f"\n\n--- {scenario_hint} ---"
+    )
 
     # Build the agent with full customer-specific instructions
     agent = RecoveryAgent(
@@ -400,16 +589,25 @@ async def entrypoint(ctx: JobContext):
     # Override instructions with customer-specific context
     agent._instructions = full_instructions
 
+    # Reuse the VAD pre-loaded in prewarm() to avoid re-loading Silero on every call
+    vad = ctx.proc.userdata.get("vad") or silero.VAD.load()
+
     logger.info("🤖 Creating AgentSession (VAD + STT + LLM + TTS)")
     session = AgentSession(
-        vad=silero.VAD.load(),
+        vad=vad,
         stt=deepgram.STT(
-            model="nova-2",
-            language="en-IN",   # Indian English — best for Hinglish
+            model="nova-3",
+            language="multi",
         ),
-        llm=livekit_google.LLM(
-            model="gemini-3.5-flash-lite",
-            api_key=settings.GOOGLE_API_KEY,
+        llm=FallbackLLM(
+            primary=livekit_google.LLM(
+                model="gemini-3.1-flash-lite",
+                api_key=settings.GOOGLE_API_KEY,
+            ),
+            fallback=livekit_google.LLM(
+                model="gemini-2.0-flash",
+                api_key=settings.GOOGLE_API_KEY,
+            ),
         ),
         tts=elevenlabs.TTS(
             api_key=settings.ELEVENLABS_API_KEY,

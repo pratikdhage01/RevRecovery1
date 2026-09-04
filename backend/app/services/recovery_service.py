@@ -15,6 +15,7 @@ from app.models.customer import (
 from app.models.policy import PolicyContext, PolicyResult, ConversationSignals
 from app.policies.recovery_policy import evaluate_policy
 from app.services import razorpay_service
+from app.services import email_service
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -270,6 +271,15 @@ async def create_recovery_payment_link(customer_id: str) -> Optional[dict]:
         reason="Policy engine authorized payment link creation",
         metadata={"link_id": link["id"], "short_url": link.get("short_url", "")},
     ))
+
+    # Send payment link to customer via email (non-blocking — failure won't break the flow)
+    await email_service.send_payment_link_email(
+        to_email=customer["contact"]["email"],
+        customer_name=customer["name"],
+        amount=customer["amount_due"],
+        short_url=link.get("short_url", ""),
+        invoice_id=str(customer["invoice_id"]),
+    )
 
     return {
         "link_id": link["id"],

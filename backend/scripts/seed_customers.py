@@ -31,7 +31,7 @@ CUSTOMERS = [
         "customer_id": "CUS_001",
         "name": "Rahul Sharma",
         "contact": {
-            "phone": "+91-9094211133",
+            "phone": "+91-9015729628",
             "email": "rooooot0101010101@gmail.com",
         },
         "invoice_id": "INV_001",
@@ -74,7 +74,7 @@ CUSTOMERS = [
         "name": "Priya Mehta",
         "contact": {
             "phone": "+91-9876500002",
-            "email": "priya.mehta.test@example.com",
+            "email": "rooooot0101010101@gmail.com",
         },
         "invoice_id": "INV_002",
         "amount_due": 4999.0,
@@ -116,7 +116,7 @@ CUSTOMERS = [
         "name": "Amit Enterprises",
         "contact": {
             "phone": "+91-9876500003",
-            "email": "amit.enterprises.test@example.com",
+            "email": "rooooot0101010101@gmail.com",
         },
         "invoice_id": "INV_003",
         "amount_due": 18500.0,
@@ -158,7 +158,7 @@ CUSTOMERS = [
         "name": "Neha Joshi",
         "contact": {
             "phone": "+91-9876500004",
-            "email": "neha.joshi.test@example.com",
+            "email": "rooooot0101010101@gmail.com",
         },
         "invoice_id": "INV_004",
         "amount_due": 1999.0,
@@ -200,7 +200,7 @@ CUSTOMERS = [
         "name": "Arjun Kapoor",
         "contact": {
             "phone": "+91-9876500005",
-            "email": "arjun.kapoor.test@example.com",
+            "email": "rooooot0101010101@gmail.com",
         },
         "invoice_id": "INV_005",
         "amount_due": 75000.0,

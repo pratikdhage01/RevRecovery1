@@ -61,6 +61,14 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
 
     # -------------------------------------------------------------------------
+    # SMTP Email (for payment link notifications)
+    # -------------------------------------------------------------------------
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""          # Your Gmail / SMTP sender address
+    SMTP_PASSWORD: str = ""      # Gmail App Password (not your login password)
+
+    # -------------------------------------------------------------------------
     # Pydantic Settings
     # -------------------------------------------------------------------------
     model_config = SettingsConfigDict(

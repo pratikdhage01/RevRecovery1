@@ -48,7 +48,9 @@ from livekit.agents import (
     WorkerOptions,
     function_tool,
 )
+from livekit.agents._exceptions import APIStatusError
 from livekit.agents.cli import run_app
+from livekit.agents import llm as agents_llm
 from livekit.plugins import deepgram, elevenlabs, silero
 from livekit.plugins import google as livekit_google
 
@@ -67,6 +69,82 @@ from app.models.customer import AuditEvent, AuditEventType
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class FallbackLLM(agents_llm.LLM):
+    """
+    Wraps a primary Google LLM and transparently falls back to a secondary
+    model when the primary returns a 503 (high-demand / unavailable) error.
+
+    Usage:
+        llm = FallbackLLM(
+            primary=livekit_google.LLM(model="gemini-3.1-flash-lite", ...),
+            fallback=livekit_google.LLM(model="gemini-2.0-flash", ...),
+        )
+    """
+
+    def __init__(
+        self,
+        primary: agents_llm.LLM,
+        fallback: agents_llm.LLM,
+    ):
+        super().__init__()
+        self._primary = primary
+        self._fallback = fallback
+
+    def chat(
+        self,
+        *,
+        chat_ctx: agents_llm.ChatContext,
+        tools: list | None = None,
+        **kwargs,
+    ) -> agents_llm.LLMStream:
+        """Try primary; on 503 fall back to secondary model."""
+        try:
+            stream = self._primary.chat(chat_ctx=chat_ctx, tools=tools, **kwargs)
+            return _FallbackStream(stream, self._fallback, chat_ctx, tools, kwargs)
+        except APIStatusError as e:
+            if e.status_code == 503:
+                logger.warning(
+                    f"Primary LLM unavailable (503), switching to fallback model. error={e}"
+                )
+                return self._fallback.chat(chat_ctx=chat_ctx, tools=tools, **kwargs)
+            raise
+
+
+class _FallbackStream(agents_llm.LLMStream):
+    """
+    Wraps a primary LLMStream and switches to the fallback LLM
+    mid-stream if a 503 is encountered during async iteration.
+    """
+
+    def __init__(self, primary_stream, fallback_llm, chat_ctx, tools, kwargs):
+        super().__init__(primary_stream._llm, chat_ctx=chat_ctx, tools=tools or [], conn_options=primary_stream._conn_options)
+        self._primary_stream = primary_stream
+        self._fallback_llm = fallback_llm
+        self._chat_ctx = chat_ctx
+        self._tools = tools
+        self._kwargs = kwargs
+
+    async def _run(self) -> None:
+        try:
+            async for chunk in self._primary_stream:
+                self._event_ch.send_nowait(chunk)
+        except APIStatusError as e:
+            if e.status_code == 503:
+                logger.warning(
+                    f"Primary LLM stream failed mid-response (503), "
+                    f"retrying with fallback model. error={e}"
+                )
+                fallback_stream = self._fallback_llm.chat(
+                    chat_ctx=self._chat_ctx,
+                    tools=self._tools,
+                    **self._kwargs,
+                )
+                async for chunk in fallback_stream:
+                    self._event_ch.send_nowait(chunk)
+            else:
+                raise
 
 # ---------------------------------------------------------------------------
 # System prompt — sets the Hinglish agent persona
@@ -407,9 +485,15 @@ async def entrypoint(ctx: JobContext):
             model="nova-2",
             language="en-IN",   # Indian English — best for Hinglish
         ),
-        llm=livekit_google.LLM(
-            model="gemini-3.5-flash-lite",
-            api_key=settings.GOOGLE_API_KEY,
+        llm=FallbackLLM(
+            primary=livekit_google.LLM(
+                model="gemini-3.1-flash-lite",
+                api_key=settings.GOOGLE_API_KEY,
+            ),
+            fallback=livekit_google.LLM(
+                model="gemini-2.0-flash",
+                api_key=settings.GOOGLE_API_KEY,
+            ),
         ),
         tts=elevenlabs.TTS(
             api_key=settings.ELEVENLABS_API_KEY,

@@ -31,8 +31,8 @@ CUSTOMERS = [
         "customer_id": "CUS_001",
         "name": "Rahul Sharma",
         "contact": {
-            "phone": "+91-9876500001",
-            "email": "rahul.sharma.test@example.com",
+            "phone": "+91-9094211133",
+            "email": "rooooot0101010101@gmail.com",
         },
         "invoice_id": "INV_001",
         "amount_due": 2499.0,

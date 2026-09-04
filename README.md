@@ -102,13 +102,15 @@ ai-revenue-recovery/
 │   │   └── agents/
 │   │       └── voice_agent.py     # LiveKit voice agent
 │   ├── scripts/
-│   │   └── seed_customers.py      # Demo data seeder
+│   │   ├── seed_customers.py      # Demo data seeder
+│   │   └── reset_db.py            # Wipe and re-seed clean database
 │   ├── tests/
 │   │   └── test_policy_engine.py  # 25 policy engine tests
 │   ├── requirements.txt
 │   └── .env.example
 │
 ├── .gitignore
+├── pyproject.toml
 └── README.md
 ```
 
@@ -172,10 +174,24 @@ cp backend/.env.example backend/.env
 
 ## Running the Application
 
-### Install Python Dependencies
+### Install Python Dependencies (uv)
+From the project root:
 ```bash
-uv pip install -r backend/requirements.txt
+# Install dependencies into .venv from pyproject.toml
+uv sync
 ```
+
+Activate the virtual environment:
+- **Windows (PowerShell):**
+  ```powershell
+  .venv\Scripts\activate
+  ```
+- **macOS / Linux:**
+  ```bash
+  source .venv/bin/activate
+  ```
+
+*(Alternatively, you can prefix python commands with `uv run`, e.g., `uv run uvicorn app.main:app --reload`)*
 
 ### Seed the Database
 ```bash
@@ -191,6 +207,13 @@ Inserted: CUS_003 — Amit Enterprises
 Inserted: CUS_004 — Neha Joshi
 Inserted: CUS_005 — Arjun Kapoor
 ```
+
+> **Tip — Reset Database to Clean State:**
+> If you want to wipe test runs and re-seed from scratch:
+> ```bash
+> cd backend
+> python scripts/reset_db.py
+> ```
 
 ### Start the Backend
 ```bash
@@ -212,6 +235,54 @@ npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000)
+
+---
+
+### Expose Backend via ngrok (Required for Webhook Payments)
+
+> **Why this is needed:** Razorpay's servers live on the internet and cannot reach `localhost:8000` on your machine. Without a public tunnel, the `payment_link.paid` webhook never arrives, so `Amount Recovered` stays at ₹0 even after a successful payment.
+
+#### Step 1 — Install ngrok
+Download and install from [https://ngrok.com/download](https://ngrok.com/download), then authenticate:
+```bash
+ngrok config add-authtoken <YOUR_NGROK_AUTHTOKEN>
+```
+
+#### Step 2 — Start the tunnel (separate terminal)
+```bash
+ngrok http 8000
+```
+
+You'll see output like:
+```
+Forwarding   https://abc123.ngrok-free.app -> http://localhost:8000
+```
+Copy the `https://...ngrok-free.app` URL.
+
+#### Step 3 — Register the webhook in Razorpay Dashboard
+1. Go to [Razorpay Dashboard](https://dashboard.razorpay.com) → **Settings → Webhooks**
+2. Click **Add New Webhook**
+3. Set **Webhook URL** to:
+   ```
+   https://abc123.ngrok-free.app/api/webhooks/razorpay
+   ```
+4. Under **Active Events**, check:
+   - `payment_link.paid`
+   - `payment.captured`
+5. Set a **Webhook Secret** and click **Save**
+
+#### Step 4 — Update your `.env`
+```bash
+RAZORPAY_WEBHOOK_SECRET=<the secret you set in step 3>
+```
+Restart the backend after saving.
+
+#### Step 5 — Test the full flow
+1. Start a voice call → get a payment link
+2. Pay using Razorpay test credentials (`4111 1111 1111 1111` / any future date / any CVV)
+3. Razorpay fires the webhook → ngrok forwards it to your backend → `Amount Recovered` updates in the dashboard ✅
+
+> **Note:** The ngrok URL changes every time you restart ngrok (on the free plan). Remember to update the webhook URL in Razorpay Dashboard whenever you restart the tunnel.
 
 ---
 

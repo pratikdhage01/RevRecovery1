@@ -51,6 +51,7 @@ from livekit.agents import (
 from livekit.agents._exceptions import APIStatusError
 from livekit.agents.cli import run_app
 from livekit.agents import llm as agents_llm
+from livekit.agents import tts as agents_tts
 from livekit.plugins import deepgram, elevenlabs, silero
 from livekit.plugins import google as livekit_google
 
@@ -145,6 +146,62 @@ class _FallbackStream(agents_llm.LLMStream):
                     self._event_ch.send_nowait(chunk)
             else:
                 raise
+
+# ---------------------------------------------------------------------------
+# TTS text normalizer — runs before every ElevenLabs synthesis call
+# Converts symbols / abbreviations to spoken-word equivalents
+# ---------------------------------------------------------------------------
+
+def normalize_for_tts(text: str) -> str:
+    """
+    Normalize text before sending to ElevenLabs TTS.
+    Converts symbols, currency, and acronyms to natural spoken English
+    so the voice model reads them correctly instead of spelling them out oddly.
+    """
+    replacements = {
+        "\u20b9": "rupees ",   # ₹ symbol
+        "INR": "rupees ",
+        "INV-": "invoice ",
+        "INV_": "invoice ",
+        "CUS_": "customer ",
+        "UPI": "U P I",
+        "OTP": "O T P",
+        "EMI": "E M I",
+        "NEFT": "N E F T",
+        "RTGS": "R T G S",
+        "payment link": "payment link",   # keep as-is (already natural)
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+class NormalizedTTS(agents_tts.TTS):
+    """
+    Thin wrapper around any TTS provider that runs normalize_for_tts()
+    on every text string before synthesis.
+    Ensures ₹, INV_, UPI, OTP etc. are always spoken correctly.
+    """
+
+    def __init__(self, inner: agents_tts.TTS):
+        super().__init__(capabilities=inner.capabilities, sample_rate=inner.sample_rate, num_channels=inner.num_channels)
+        self._inner = inner
+
+    def synthesize(self, text: str, *, conn_options=None):
+        """Normalize then synthesize a complete utterance."""
+        if conn_options is not None:
+            return self._inner.synthesize(normalize_for_tts(text), conn_options=conn_options)
+        return self._inner.synthesize(normalize_for_tts(text))
+
+    def stream(self, *, conn_options=None):
+        """Pass streaming synthesis through unchanged (text is pushed incrementally)."""
+        if conn_options is not None:
+            return self._inner.stream(conn_options=conn_options)
+        return self._inner.stream()
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
 
 # ---------------------------------------------------------------------------
 # System prompt — sets the Hinglish agent persona
@@ -522,7 +579,7 @@ async def entrypoint(ctx: JobContext):
 
     # Short greeting — TTS ends fast so agent enters listening mode quickly.
     # Invoice details are already in the LLM system prompt; no need to repeat in greeting.
-    initial_message = (
+    initial_message = normalize_for_tts(
         f"Namaste {customer['name']}! Aapke account mein {spoken_amount} ka payment pending hai. "
         f"Kya main help kar sakta hoon?"
     )
@@ -610,10 +667,12 @@ async def entrypoint(ctx: JobContext):
                 api_key=settings.GOOGLE_API_KEY,
             ),
         ),
-        tts=elevenlabs.TTS(
-            api_key=settings.ELEVENLABS_API_KEY,
-            voice_id=settings.ELEVENLABS_VOICE_ID,
-            model="eleven_multilingual_v2",  # Supports Hindi
+        tts=NormalizedTTS(
+            elevenlabs.TTS(
+                api_key=settings.ELEVENLABS_API_KEY,
+                voice_id=settings.ELEVENLABS_VOICE_ID,
+                model="eleven_multilingual_v2",  # Supports Hindi
+            )
         ),
         max_tool_steps=8,
     )
